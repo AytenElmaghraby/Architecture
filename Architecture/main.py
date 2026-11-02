@@ -1,5 +1,7 @@
 # Digital Logic Design Project
 import itertools  # we need this to make all the input combinations
+from sympy import Symbol, Not, And, Or
+from sympy.logic import SOPform, simplify_logic
 
 # ======================================================
 # Part 1: asking the user for the number of inputs
@@ -72,8 +74,7 @@ ALLOWED_SYMBOLS = ["'", "+", ".", "*", "(", ")", " "]
 
 def read_expression(names):
     # what it does: asks the user to enter the boolean expression
-    #               and checks that it is a correct expression
-    #               (allowed characters, balanced brackets, correct syntax)
+    #               and checks that it is written correctly
     # it takes: names (the variable names, for example ["A", "B", "C"])
     # it returns: the expression as text, for example "A'B + AC"
 
@@ -91,16 +92,14 @@ def read_expression(names):
 
         is_valid = True
 
-        # check every character alone
+        # check 1: every character must be a variable or an allowed symbol
         for ch in text:
-            # the character must be a variable name or an allowed symbol
             if ch not in names and ch not in ALLOWED_SYMBOLS:
                 print("Error: the character '" + ch + "' is not allowed.")
                 is_valid = False
                 break
 
-        # check that the number of "(" is equal to the number of ")"
-        # we use a counter that goes up with "(" and goes down with ")"
+        # check 2: the brackets must be balanced
         if is_valid:
             counter = 0
             for ch in text:
@@ -108,21 +107,24 @@ def read_expression(names):
                     counter += 1
                 elif ch == ")":
                     counter -= 1
-                # if the counter goes below 0 then we closed a bracket that was never opened
-                if counter < 0:
+                if counter < 0:  # a ")" came before its "("
                     break
-            # at the end the counter must be exactly 0
             if counter != 0:
                 print("Error: the brackets are not balanced.")
                 is_valid = False
 
-        # check that the expression has a correct form (for example "A+" or "+B" is wrong)
-        # we do this by trying to parse it, if the parser fails the expression is wrong
+        # check 3: try to calculate it once, if it fails the form is wrong
+        # (example: "A++B" or "A+")
         if is_valid:
             try:
-                parse_expression(text, names)
-            except ValueError as error:
-                print("Error: invalid expression (" + str(error) + ").")
+                test_values = {name: 0 for name in names}
+                result = eval(
+                    convert_expression(text), {"N": lambda x: 1 - x}, test_values
+                )
+                if result not in (0, 1):
+                    raise ValueError
+            except Exception:
+                print("Error: the expression is not written correctly.")
                 is_valid = False
 
         # if every check passed we return the text
@@ -146,599 +148,269 @@ def print_truth_table(names, rows, outputs):
 
 
 # ======================================================
-# Part 4: understanding the expression (parser)
+# Part 4: calculating the outputs
 # ======================================================
-# The computer cannot calculate the text "A'B + AC" directly.
-# So we change the text to a "tree" that shows the order of the operations.
-# Example: A'B + AC becomes
-#   ("OR", ("AND", ("NOT", ("VAR", "A")), ("VAR", "B")),
-#          ("AND", ("VAR", "A"), ("VAR", "C")))
-# The rules (from the weakest operator to the strongest):
-#   expression = term + term + ...        (OR is the weakest)
-#   term       = factor . factor ...      (AND, and "AB" with nothing between means AND too)
-#   factor     = primary followed by ' ... (NOT)
-#   primary    = a variable, or (expression)
+def convert_expression(text):
+    # what it does: changes our expression to a python expression
+    #               A'B + AC  becomes  N(A)&B|A&C
+    #               (N means NOT, & means AND, | means OR)
+    # it takes: text (the expression)
+    # it returns: the python expression as text
+
+    text = text.replace(" ", "")
+    out = []  # the pieces of the python expression
+    stack = []  # the places of the "(" that are still open
+    unit = 0  # where the last variable or bracket group started
+    prev = ""  # the character before the current one
+
+    for ch in text:
+        if ch.isalpha():
+            # two things next to each other mean AND (like AB or A(B+C))
+            if prev.isalpha() or prev == ")" or prev == "'":
+                out.append("&")
+            unit = len(out)
+            out.append(ch)
+        elif ch == "(":
+            if prev.isalpha() or prev == ")" or prev == "'":
+                out.append("&")
+            stack.append(len(out))
+            out.append("(")
+        elif ch == ")":
+            out.append(")")
+            unit = stack.pop()  # the group started at the matching "("
+        elif ch == "'":
+            # put N( before the last variable/group and ) after it
+            out.insert(unit, "N(")
+            out.append(")")
+        elif ch == "+":
+            out.append("|")
+        elif ch == "." or ch == "*":
+            out.append("&")
+        prev = ch
+
+    return "".join(out)
 
 
-class Parser:
-    # what it does: reads the expression text and builds the tree
-    # it takes: tokens (list of characters without spaces) and names (variable names)
-
-    def __init__(self, tokens, names):
-        self.tokens = tokens
-        self.names = names
-        self.pos = 0  # the position of the character we are reading now
-
-    def peek(self):
-        # what it does: looks at the current character without moving
-        # it returns: the character, or None if we reached the end
-        if self.pos < len(self.tokens):
-            return self.tokens[self.pos]
-        return None
-
-    def parse(self):
-        # what it does: builds the full tree and checks nothing is left after it
-        # it returns: the tree
-        tree = self.parse_or()
-        if self.pos != len(self.tokens):
-            raise ValueError("unexpected '" + self.tokens[self.pos] + "'")
-        return tree
-
-    def parse_or(self):
-        # handles: term + term + term ...
-        left = self.parse_and()
-        while self.peek() == "+":
-            self.pos += 1  # skip the +
-            right = self.parse_and()
-            left = ("OR", left, right)
-        return left
-
-    def parse_and(self):
-        # handles: factor . factor, factor * factor, and factor factor (like AB)
-        left = self.parse_not()
-        while True:
-            t = self.peek()
-            if t == "." or t == "*":
-                self.pos += 1  # skip the . or *
-                right = self.parse_not()
-                left = ("AND", left, right)
-            elif t is not None and (t in self.names or t == "("):
-                # a variable or a bracket directly after a factor means AND (like A'B or A(B+C))
-                right = self.parse_not()
-                left = ("AND", left, right)
-            else:
-                break
-        return left
-
-    def parse_not(self):
-        # handles: primary followed by one or more '
-        node = self.parse_primary()
-        while self.peek() == "'":
-            self.pos += 1  # skip the '
-            node = ("NOT", node)
-        return node
-
-    def parse_primary(self):
-        # handles: a variable, or an expression inside brackets
-        t = self.peek()
-        if t is None:
-            raise ValueError("the expression ended too early")
-        if t in self.names:
-            self.pos += 1
-            return ("VAR", t)
-        if t == "(":
-            self.pos += 1  # skip the (
-            node = self.parse_or()
-            if self.peek() != ")":
-                raise ValueError("missing ')'")
-            self.pos += 1  # skip the )
-            return node
-        raise ValueError("unexpected '" + t + "'")
-
-
-def parse_expression(text, names):
-    # what it does: changes the expression text to a tree
-    # it takes: text (the expression) and names (the variable names)
-    # it returns: the tree (it raises ValueError if the expression is wrong)
-
-    # remove the spaces, then give the characters to the parser
-    tokens = [ch for ch in text if ch != " "]
-    return Parser(tokens, names).parse()
-
-
-def evaluate_tree(tree, values):
-    # what it does: calculates the value (0 or 1) of the tree for one input row
-    # it takes: tree (from parse_expression) and values (a dictionary like {"A": 1, "B": 0})
-    # it returns: 0 or 1
-
-    kind = tree[0]
-    if kind == "VAR":
-        return values[tree[1]]
-    if kind == "NOT":
-        return 1 - evaluate_tree(tree[1], values)
-    if kind == "AND":
-        return evaluate_tree(tree[1], values) & evaluate_tree(tree[2], values)
-    # the only kind left is OR
-    return evaluate_tree(tree[1], values) | evaluate_tree(tree[2], values)
-
-
-# ======================================================
-# Part 5: calculating the output column
-# ======================================================
-def compute_outputs(tree, names, rows):
+def calculate_outputs(names, rows, expression):
     # what it does: calculates F for every row of the truth table
-    # it takes: tree (the expression tree), names (variable names), rows (input combinations)
-    # it returns: a list of 0 and 1 (the output column), one value for every row
+    # it takes: names, rows, expression
+    # it returns: a list of 0 and 1 (the output column)
 
+    python_expression = convert_expression(expression)
     outputs = []
     for row in rows:
-        # connect every name with its bit, for example {"A": 0, "B": 1, "C": 1}
-        values = dict(zip(names, row))
-        outputs.append(evaluate_tree(tree, values))
+        values = dict(zip(names, row))  # for example {"A": 0, "B": 1}
+        result = eval(python_expression, {"N": lambda x: 1 - x}, values)
+        outputs.append(result)
     return outputs
 
 
-def get_minterms(outputs):
-    # what it does: finds the rows where F = 1
-    # it takes: outputs (the output column)
-    # it returns: a list of row numbers, for example [1, 3, 7]
-    #             (row number = the binary value of the inputs, A is the left bit)
+# ======================================================
+# Part 5: simplifying (we use sympy for the hard work)
+# ======================================================
+def sympy_to_terms(expr):
+    # what it does: changes a sympy expression to a simple list of terms
+    #               A'B + AC  becomes  [[("A", True), ("B", False)], [("A", False), ("C", False)]]
+    #               (True means the variable has a NOT on it)
+    # it takes: expr (a sympy expression in sum-of-products form)
+    # it returns: a list of terms ([] means F = 0, [[]] means F = 1)
 
-    return [i for i in range(len(outputs)) if outputs[i] == 1]
+    if expr == False:
+        return []
+    if expr == True:
+        return [[]]
+
+    # the expression is an OR of AND terms (or just one term)
+    if isinstance(expr, Or):
+        products = expr.args
+    else:
+        products = [expr]
+
+    terms = []
+    for product in products:
+        if isinstance(product, And):
+            literals = product.args
+        else:
+            literals = [product]
+        term = []
+        for lit in literals:
+            if isinstance(lit, Not):
+                term.append((str(lit.args[0]), True))
+            else:
+                term.append((str(lit), False))
+        term.sort()
+        terms.append(term)
+    terms.sort()
+    return terms
+
+
+def literal_text(name, negated):
+    # returns "A'" if negated, otherwise "A"
+    if negated:
+        return name + "'"
+    return name
+
+
+def terms_to_text(terms):
+    # what it does: changes the list of terms to a readable expression
+    if terms == []:
+        return "0"
+    if terms == [[]]:
+        return "1"
+    parts = []
+    for term in terms:
+        parts.append("".join(literal_text(n, neg) for n, neg in term))
+    return " + ".join(parts)
+
+
+def get_simplified_terms(names, outputs):
+    # what it does: simplifies the function using minterms (Quine-McCluskey)
+    #               this gives the same result as grouping in a K-Map
+    # it takes: names, outputs
+    # it returns: the simplified terms
+    symbols = [Symbol(name) for name in names]
+    minterms = [i for i in range(len(outputs)) if outputs[i] == 1]
+    return sympy_to_terms(SOPform(symbols, minterms))
 
 
 # ======================================================
-# Part 6: finding the simplest form (Quine-McCluskey)
-# ======================================================
-# This is the math way to do exactly what we do in the K-map:
-# join terms that are different in only one variable (like ABC + ABC' = AB).
-# A term is written as a text of 0, 1 and -
-#   1 = the variable is normal, 0 = the variable is complemented, - = the variable is removed
-#   example for 3 variables: "01-" means A'B
-
-
-def minterm_text(term, names):
-    # what it does: changes a term like "01-" to a readable text like "A'B"
-    # it takes: term (text of 0/1/-) and names (variable names)
-    # it returns: the text of the product term ("1" if all variables were removed)
-
-    text = ""
-    for i in range(len(term)):
-        if term[i] == "1":
-            text += names[i]
-        elif term[i] == "0":
-            text += names[i] + "'"
-    if text == "":
-        text = "1"
-    return text
-
-
-def find_prime_implicants(minterms, n):
-    # what it does: joins the terms again and again until no more joining is possible.
-    #               the terms that cannot be joined anymore are the "prime implicants"
-    #               (they are the biggest groups of the K-map)
-    # it takes: minterms (list of row numbers where F = 1) and n (number of inputs)
-    # it returns: primes (a set of terms) and log (a list of every joining we did, we use it
-    #             to show the Boolean algebra steps)
-
-    # start with every minterm as a binary text, for example 5 with n = 3 becomes "101"
-    current = set(format(m, "0" + str(n) + "b") for m in minterms)
-    primes = set()
-    log = []
-
-    while len(current) > 0:
-        used = set()  # terms that were joined in this round
-        next_round = set()  # the new terms made in this round
-        pass_log = []
-        items = sorted(current)
-
-        # try every two terms
-        for i in range(len(items)):
-            for j in range(i + 1, len(items)):
-                a = items[i]
-                b = items[j]
-                diff_pos = -1
-                diff_count = 0
-                ok = True
-                for k in range(n):
-                    if a[k] != b[k]:
-                        # the "-" must be in the same place in both terms
-                        if a[k] == "-" or b[k] == "-":
-                            ok = False
-                            break
-                        diff_count += 1
-                        diff_pos = k
-                # we can join them only if they differ in exactly one variable
-                if ok and diff_count == 1:
-                    merged = a[:diff_pos] + "-" + a[diff_pos + 1 :]
-                    next_round.add(merged)
-                    used.add(a)
-                    used.add(b)
-                    pass_log.append((a, b, merged))
-
-        # the terms that were not joined with anyone are prime implicants
-        primes = primes | (current - used)
-        if len(pass_log) > 0:
-            log.append(pass_log)
-        current = next_round
-
-    return primes, log
-
-
-def covers(term, minterm, n):
-    # what it does: checks if a term covers (includes) a minterm
-    # it takes: term (text of 0/1/-), minterm (row number), n (number of inputs)
-    # it returns: True or False
-
-    bits = format(minterm, "0" + str(n) + "b")
-    for i in range(n):
-        if term[i] != "-" and term[i] != bits[i]:
-            return False
-    return True
-
-
-def select_cover(primes, minterms, n):
-    # what it does: chooses the smallest set of prime implicants that covers all the minterms
-    #               step 1: take the essential ones (the only ones that cover some minterm)
-    #               step 2: for what is left, keep taking the one that covers the most
-    # it takes: primes, minterms, n
-    # it returns: a sorted list of the chosen terms
-
-    chosen = []
-    ordered = sorted(primes)
-
-    # step 1: essential prime implicants
-    for m in minterms:
-        candidates = [p for p in ordered if covers(p, m, n)]
-        if len(candidates) == 1 and candidates[0] not in chosen:
-            chosen.append(candidates[0])
-
-    # remove the minterms that are already covered
-    uncovered = set(minterms)
-    for p in chosen:
-        for m in minterms:
-            if covers(p, m, n):
-                uncovered.discard(m)
-
-    # step 2: cover the rest
-    while len(uncovered) > 0:
-        best = max(
-            ordered, key=lambda p: len([m for m in uncovered if covers(p, m, n)])
-        )
-        chosen.append(best)
-        for m in minterms:
-            if covers(best, m, n):
-                uncovered.discard(m)
-
-    return sorted(chosen)
-
-
-def handle_constant(minterms, n):
-    # what it does: checks if F is always 0 or always 1 (then there is nothing to simplify)
-    # it takes: minterms and n
-    # it returns: True if F is a constant (and prints the answer), otherwise False
-
-    if len(minterms) == 0:
-        print("F is always 0, so F = 0 (no gates are needed).")
-        return True
-    if len(minterms) == 2**n:
-        print("F is always 1, so F = 1 (no gates are needed).")
-        return True
-    return False
-
-
-def get_simplified_terms(minterms, n):
-    # what it does: runs the whole simplification and gives the final terms
-    # it takes: minterms and n
-    # it returns: the list of chosen terms (text of 0/1/-)
-
-    primes, log = find_prime_implicants(minterms, n)
-    return select_cover(primes, minterms, n)
-
-
-def terms_to_expression(terms, names):
-    # what it does: changes a list of terms to a full expression like "A'B + C"
-    # it takes: terms (list of 0/1/- texts) and names
-    # it returns: the expression as text
-
-    return " + ".join(minterm_text(t, names) for t in terms)
-
-
-# ======================================================
-# Part 7: option 1 - simplify using K-Map
+# Part 6: menu option 1 - simplify using K-Map
 # ======================================================
 def gray_code(k):
-    # what it does: makes the Gray code order for k bits (only one bit changes between neighbors)
-    #               this is the order of the rows and columns of the K-map
-    # it takes: k (number of bits)
-    # it returns: a list of texts, for example k = 2 gives ["00", "01", "11", "10"]
-
+    # what it does: makes the gray code of k bits (only one bit changes each step)
+    #               k = 2 gives ["00", "01", "11", "10"]
     if k == 0:
         return [""]
     return [format(i ^ (i >> 1), "0" + str(k) + "b") for i in range(2**k)]
 
 
-def print_single_kmap(var_names, outputs, offset):
-    # what it does: prints one K-map table
-    # it takes: var_names (the variables of this map), outputs (the output column)
-    #           and offset (the start position in the outputs, used for the 5-variable case)
-    # it returns: nothing, it only prints
-
-    # half of the variables go to the rows and the rest go to the columns
-    row_count = len(var_names) // 2
-    col_count = len(var_names) - row_count
+def print_kmap(names, outputs):
+    # what it does: prints the K-Map table
+    n = len(names)
+    row_count = n // 2  # variables on the side
+    col_count = n - row_count  # variables on the top
     row_codes = gray_code(row_count)
     col_codes = gray_code(col_count)
 
-    label = "".join(var_names[:row_count]) + "\\" + "".join(var_names[row_count:])
-    print(label.ljust(8) + "".join(c.center(5) for c in col_codes))
+    corner = "".join(names[:row_count]) + "\\" + "".join(names[row_count:])
+    print(corner.ljust(8) + "".join(c.ljust(6) for c in col_codes))
     for r in row_codes:
         line = r.ljust(8)
         for c in col_codes:
-            # the number of the cell is the binary value of (row bits + column bits)
-            index = offset + int(r + c, 2)
-            line += str(outputs[index]).center(5)
+            index = int(r + c, 2)  # the row number in the truth table
+            line += str(outputs[index]).ljust(6)
         print(line)
 
 
-def print_kmap(names, outputs, n):
-    # what it does: prints the K-map (for 5 variables it prints two maps: A = 0 and A = 1)
-    # it takes: names, outputs, n
-    # it returns: nothing, it only prints
-
-    if n == 5:
-        for a in (0, 1):
-            print("\nWhen A = " + str(a) + ":")
-            print_single_kmap(names[1:], outputs, a * 16)
-    else:
-        print()
-        print_single_kmap(names, outputs, 0)
-
-
-def simplify_kmap(names, outputs, n):
-    # what it does: shows the K-map, the groups, and the simplified expression
-    # it takes: names, outputs, n
-    # it returns: nothing, it only prints
-
-    print("\n--- K-Map ---")
-    print_kmap(names, outputs, n)
-
-    minterms = get_minterms(outputs)
-    print()
-    if handle_constant(minterms, n):
-        return
-
-    chosen = get_simplified_terms(minterms, n)
-
-    # every chosen term is one group in the K-map
-    print("Groups (every group is a block of 1s in the K-map):")
-    for i in range(len(chosen)):
-        covered = [str(m) for m in minterms if covers(chosen[i], m, n)]
-        print(
-            "  Group "
-            + str(i + 1)
-            + ": cells (m"
-            + ", m".join(covered)
-            + ")  ->  "
-            + minterm_text(chosen[i], names)
-        )
-
-    print("\nSimplified expression:")
-    print("F = " + terms_to_expression(chosen, names))
+def simplify_kmap(names, outputs):
+    print("\nK-Map:")
+    print_kmap(names, outputs)
+    terms = get_simplified_terms(names, outputs)
+    print("\nSimplified expression (groups of 1s):")
+    print("F = " + terms_to_text(terms))
 
 
 # ======================================================
-# Part 8: option 2 - simplify using Boolean Algebra
+# Part 7: menu option 2 - simplify using Boolean Algebra
 # ======================================================
-MAX_STEPS_SHOWN = 10  # we show only this number of joinings in each round so the screen is not too long
-
-
-def simplify_boolean_algebra(names, outputs, n):
-    # what it does: shows the simplification steps using Boolean algebra laws
-    # it takes: names, outputs, n
-    # it returns: nothing, it only prints
-
-    print("\n--- Simplify using Boolean Algebra ---")
-    minterms = get_minterms(outputs)
-    if handle_constant(minterms, n):
-        return
-
-    # step 1: write F as a sum of minterms (every row with F = 1)
-    print("\nStep 1: write F as a sum of minterms (rows where F = 1):")
-    canonical = [format(m, "0" + str(n) + "b") for m in minterms]
-    print("F = " + terms_to_expression(canonical, names))
-
-    primes, log = find_prime_implicants(minterms, n)
-
-    # step 2: join the terms that differ in only one variable
-    print("\nStep 2: join the terms using the law  X.Y + X.Y' = X")
-    for r in range(len(log)):
-        print(" Round " + str(r + 1) + ":")
-        shown = 0
-        for a, b, merged in log[r]:
-            if shown >= MAX_STEPS_SHOWN:
-                print(
-                    "   ... and "
-                    + str(len(log[r]) - MAX_STEPS_SHOWN)
-                    + " more joinings"
-                )
-                break
-            print(
-                "   "
-                + minterm_text(a, names)
-                + " + "
-                + minterm_text(b, names)
-                + " = "
-                + minterm_text(merged, names)
-            )
-            shown += 1
-    print(" (If the same term appears twice we keep one only, using X + X = X)")
-
-    # step 3: the terms that cannot be joined anymore
-    print("\nStep 3: the terms that cannot be simplified more:")
-    print("  " + terms_to_expression(sorted(primes), names))
-
-    # step 4: remove the terms that are not needed
-    chosen = select_cover(primes, minterms, n)
-    removed = [p for p in sorted(primes) if p not in chosen]
-    print(
-        "\nStep 4: remove the terms that are not needed (absorption / redundant terms):"
-    )
-    if len(removed) == 0:
-        print("  No term can be removed.")
-    else:
-        print("  Removed: " + terms_to_expression(removed, names))
-
-    print("\nFinal simplified expression:")
-    print("F = " + terms_to_expression(chosen, names))
+def simplify_algebra(names, expression):
+    # what it does: simplifies the expression the user wrote using boolean algebra laws
+    symbols = {name: Symbol(name) for name in names}
+    expr = eval(convert_expression(expression), {"N": Not}, symbols)
+    simplified = simplify_logic(expr, form="dnf")  # dnf = sum of products
+    terms = sympy_to_terms(simplified)
+    print("\nOriginal  : F = " + expression)
+    print("Simplified: F = " + terms_to_text(terms))
 
 
 # ======================================================
-# Part 9: option 3 - draw the logic circuit
+# Part 8: menu option 3 - draw the logic circuit
 # ======================================================
 def draw_gate(inputs, gate_name, output_name):
-    # what it does: makes a small text drawing of one gate
-    # it takes: inputs (list of input names), gate_name ("AND" or "OR") and output_name
-    # it returns: a list of text lines (the drawing)
-
-    width = max(len(s) for s in inputs)
-    middle = len(inputs) // 2  # the line where we write the gate name and the output
-    lines = []
-    lines.append(" " * (width + 5) + "+-------+")
-    for i in range(len(inputs)):
-        left = inputs[i].ljust(width) + " ----"
-        if i == middle:
-            lines.append(left + "| " + gate_name.center(5) + " |---- " + output_name)
-        else:
-            lines.append(left + "|       |")
-    lines.append(" " * (width + 5) + "+-------+")
-    return lines
-
-
-def draw_circuit(names, outputs, n):
-    # what it does: draws the logic circuit of the simplified expression (AND gates then one OR gate)
-    # it takes: names, outputs, n
-    # it returns: nothing, it only prints
-
-    print("\n--- Logic Circuit ---")
-    minterms = get_minterms(outputs)
-    if handle_constant(minterms, n):
+    # what it does: draws one gate with text
+    # it takes: inputs (list of names), gate_name ("AND" or "OR"), output_name
+    if len(inputs) == 1:
+        # one input only: no gate needed, just a wire
+        print("  " + inputs[0].ljust(3) + " ---------- " + output_name)
         return
 
-    chosen = get_simplified_terms(minterms, n)
-    print("Circuit of: F = " + terms_to_expression(chosen, names))
-
-    # collect the inputs of every product term (like ["A'", "B"])
-    term_literals = []
-    for t in chosen:
-        literals = []
-        for i in range(n):
-            if t[i] == "1":
-                literals.append(names[i])
-            elif t[i] == "0":
-                literals.append(names[i] + "'")
-        term_literals.append(literals)
-
-    # find which variables need a NOT gate
-    not_needed = sorted(
-        set(lit[:-1] for lits in term_literals for lit in lits if lit.endswith("'"))
-    )
-    print("\nInputs: " + ", ".join(names))
-    if len(not_needed) > 0:
-        print(
-            "NOT gates needed: " + ", ".join(v + " -> " + v + "'" for v in not_needed)
-        )
-    else:
-        print("NOT gates needed: none")
-
-    # draw the AND gates (a term with one literal is only a wire, it needs no gate)
-    or_inputs = []
-    gate_number = 1
-    for literals in term_literals:
-        if len(literals) == 1:
-            or_inputs.append(literals[0])
+    label = gate_name.center(5)
+    print(" " * 9 + "+-----+")
+    for j in range(len(inputs)):
+        line = "  " + inputs[j].ljust(3) + " ---|"
+        if j == len(inputs) // 2:
+            line += label + "|--- " + output_name
         else:
-            gate_name = "G" + str(gate_number)
-            gate_number += 1
-            print("\nAND gate " + gate_name + ":")
-            for line in draw_gate(literals, "AND", gate_name):
-                print(line)
-            or_inputs.append(gate_name)
+            line += "     |"
+        print(line)
+    print(" " * 9 + "+-----+")
 
-    # draw the final OR gate (if we have only one term then no OR gate is needed)
-    if len(or_inputs) == 1:
-        print("\nOutput: F = " + or_inputs[0] + "  (no OR gate is needed)")
-    else:
-        print("\nOR gate (the final output):")
-        for line in draw_gate(or_inputs, "OR", "F"):
-            print(line)
+
+def draw_circuit(names, outputs):
+    # what it does: draws the simplified circuit (NOT gates -> AND gates -> OR gate)
+    terms = get_simplified_terms(names, outputs)
+
+    if terms == []:
+        print("\nF = 0 (the output is always 0, no gates needed).")
+        return
+    if terms == [[]]:
+        print("\nF = 1 (the output is always 1, no gates needed).")
+        return
+
+    print("\nF = " + terms_to_text(terms))
+
+    # which variables need a NOT gate
+    not_list = sorted({n for term in terms for n, neg in term if neg})
+    if not_list:
+        print(
+            "NOT gates needed for: "
+            + ", ".join(not_list)
+            + "  (A' means A after a NOT gate)"
+        )
+
+    print("\nAND gates:")
+    gate_outputs = []
+    for i in range(len(terms)):
+        gate_name = "G" + str(i + 1)
+        lits = [literal_text(n, neg) for n, neg in terms[i]]
+        draw_gate(lits, "AND", gate_name)
+        gate_outputs.append(gate_name)
+        print()
+
+    print("OR gate:")
+    draw_gate(gate_outputs, "OR", "F")
 
 
 # ======================================================
-# Part 10: option 4 - implement using a Decoder
+# Part 9: menu option 4 - implement using a decoder
 # ======================================================
-def implement_with_decoder(names, outputs, n):
-    # what it does: shows how to build F using an n-to-2^n decoder and one OR gate
-    #               (the decoder gives one output line for every minterm, we OR the lines where F = 1)
-    # it takes: names, outputs, n
-    # it returns: nothing, it only prints
+def implement_decoder(names, outputs):
+    # what it does: shows how to build F using a decoder and an OR gate
+    n = len(names)
+    minterms = [i for i in range(len(outputs)) if outputs[i] == 1]
 
-    print("\n--- Implementation using a Decoder ---")
-    size = 2**n
-    minterms = get_minterms(outputs)
-
-    print(
-        "Use a "
-        + str(n)
-        + "-to-"
-        + str(size)
-        + " decoder, its inputs are: "
-        + ", ".join(names)
-        + " ("
-        + names[0]
-        + " is the most significant bit)"
-    )
-    print("\nDecoder outputs:")
-    for i in range(size):
+    print("\nWe need one " + str(n) + "x" + str(2**n) + " decoder.")
+    print("Decoder inputs: " + ", ".join(names) + "  (" + names[0] + " is the MSB)")
+    print("Each decoder output Di is 1 only for input combination number i:")
+    for i in range(2**n):
         bits = format(i, "0" + str(n) + "b")
-        if i in minterms:
-            note = "-> connect to the OR gate"
-        else:
-            note = "-> not used"
-        print("  D" + str(i) + "  (" + "".join(names) + " = " + bits + ")  " + note)
+        text = "".join(literal_text(names[j], bits[j] == "0") for j in range(n))
+        print("  D" + str(i) + " = " + text)
 
-    print()
-    if len(minterms) == 0:
-        print("F = 0 (no decoder output is used, F is connected to ground).")
-    elif len(minterms) == 1:
-        print("F = D" + str(minterms[0]) + "  (no OR gate is needed)")
+    if minterms == []:
+        print("\nF = 0, no decoder outputs are connected.")
+    elif len(minterms) == 2**n:
+        print("\nF = 1, the output is always 1.")
     else:
-        print(
-            "F = "
-            + " + ".join("D" + str(m) for m in minterms)
-            + "   (one OR gate with "
-            + str(len(minterms))
-            + " inputs)"
-        )
-
-    # a small hint: if F has more 1s than 0s it is cheaper to OR the unused lines and use NOR
-    if len(minterms) > size // 2 and len(minterms) < size:
-        zeros = [i for i in range(size) if i not in minterms]
-        print(
-            "Note: F has more 1s than 0s, so you can also use a NOR gate on "
-            + ", ".join("D" + str(z) for z in zeros)
-            + " (this gives F)."
-        )
+        print("\nF = sum of minterms m(" + ", ".join(str(m) for m in minterms) + ")")
+        print("Connect these decoder outputs to one OR gate:\n")
+        draw_gate(["D" + str(m) for m in minterms], "OR", "F")
 
 
 # ======================================================
-# Part 11: the menu and the main program
+# Part 10: the menu and the main program
 # ======================================================
 def show_menu():
-    # what it does: prints the menu options
-    # it takes: nothing
-    # it returns: nothing, it only prints
-
     print("\n========== MENU ==========")
     print("1. Simplify using K-Map")
     print("2. Simplify using Boolean Algebra")
@@ -747,54 +419,35 @@ def show_menu():
     print("5. Exit")
 
 
-def get_menu_choice():
-    # what it does: asks the user for a menu option and keeps asking until it is valid
-    # it takes: nothing
-    # it returns: the choice as a text ("1" to "5")
-
-    while True:
-        choice = input("Choose an option (1-5): ").strip()
-        if choice in ["1", "2", "3", "4", "5"]:
-            return choice
-        # an invalid choice does not stop the program, we only show the error and ask again
-        print("Error: invalid choice, please enter a number from 1 to 5.")
-
-
 def main():
-    # what it does: runs the whole program
-    #               1) reads n and the expression, 2) prints the truth table,
-    #               3) shows the menu again and again until the user chooses Exit
-    # it takes: nothing
-    # it returns: nothing
-
     n = get_number_of_inputs()
     names = get_variable_names(n)
     rows = generate_combinations(n)
     expression = read_expression(names)
-    print("The expression is: F = " + expression)
+    outputs = calculate_outputs(names, rows, expression)
 
-    # calculate and print the truth table
-    tree = parse_expression(expression, names)
-    outputs = compute_outputs(tree, names, rows)
-    print("\n--- Truth Table ---")
+    print("\nThe expression is: F = " + expression)
+    print("\nTruth table:")
     print_truth_table(names, rows, outputs)
 
-    # the menu loop: it stops only when the user chooses Exit
+    # the menu keeps coming back until the user chooses Exit
     while True:
         show_menu()
-        choice = get_menu_choice()
+        choice = input("Enter your choice (1-5): ").strip()
+
         if choice == "1":
-            simplify_kmap(names, outputs, n)
+            simplify_kmap(names, outputs)
         elif choice == "2":
-            simplify_boolean_algebra(names, outputs, n)
+            simplify_algebra(names, expression)
         elif choice == "3":
-            draw_circuit(names, outputs, n)
+            draw_circuit(names, outputs)
         elif choice == "4":
-            implement_with_decoder(names, outputs, n)
-        else:
+            implement_decoder(names, outputs)
+        elif choice == "5":
             print("Goodbye!")
             break
+        else:
+            print("Error: please choose a number from 1 to 5.")
 
 
-# start the program
 main()
